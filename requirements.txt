@@ -1,0 +1,12 @@
+
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+psycopg[binary]
+pydantic-settings
+prometheus-client
+pytest
+pytest-cov
+httpx
+ruff
