@@ -1,5 +1,22 @@
 
 services:
+  api:
+    build: .
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fulfillops}
+      POSTGRES_USER: ${POSTGRES_USER:-fulfillops}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      DB_HOST: db
+      DB_PORT: 5432
+
+    depends_on:
+      db:
+        condition: service_healthy
   db:
     image: postgres:16
     container_name: fulfillops-db
