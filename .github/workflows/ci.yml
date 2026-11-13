@@ -1,3 +1,4 @@
+
 name: FulfillOps CI
 
 on:
@@ -49,3 +50,38 @@ jobs:
 
       - name: Run automated tests
         run: python -m pytest -q
+
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t fulfillops-api:ci .
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: fulfillops-api:ci
+          format: json
+          output: trivy-report.json
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: fulfillops-api:ci
+          format: cyclonedx
+          output: sbom.json
+          exit-code: '0'
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: fulfillops-security-reports
+          path: |
+            trivy-report.json
+            sbom.json
