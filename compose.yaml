@@ -1,26 +1,70 @@
-
 services:
   db:
     image: postgres:16
     container_name: fulfillops-db
     restart: unless-stopped
-
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-fulfillops}
       POSTGRES_USER: ${POSTGRES_USER:-fulfillops}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
-
     ports:
       - "${DB_PORT:-5433}:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fulfillops} -d ${POSTGRES_DB:-fulfillops}"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-fulfillops} -d ${POSTGRES_DB:-fulfillops}
       interval: 5s
       timeout: 3s
       retries: 10
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fulfillops}
+      POSTGRES_USER: ${POSTGRES_USER:-fulfillops}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      DB_HOST: db
+      DB_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fulfillops}
+      POSTGRES_USER: ${POSTGRES_USER:-fulfillops}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      DB_HOST: db
+      DB_PORT: "5432"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    command: ["python", "-m", "worker.main"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fulfillops}
+      POSTGRES_USER: ${POSTGRES_USER:-fulfillops}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      DB_HOST: db
+      DB_PORT: "5432"
+      WORKER_ID: worker-1
+      POLL_INTERVAL: "2"
+      MAX_ATTEMPTS: "5"
+      LEASE_SECONDS: "30"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:

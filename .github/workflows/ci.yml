@@ -1,0 +1,87 @@
+
+name: FulfillOps CI
+
+on:
+  push:
+    branches: [main, feature/devops]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: fulfillops_test
+          POSTGRES_USER: fulfillops
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fulfillops -d fulfillops_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      POSTGRES_DB: fulfillops_test
+      POSTGRES_USER: fulfillops
+      DB_PASSWORD: ci_test_password
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Run automated tests
+        run: python -m pytest -q
+
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t fulfillops-api:ci .
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: fulfillops-api:ci
+          format: json
+          output: trivy-report.json
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: fulfillops-api:ci
+          format: cyclonedx
+          output: sbom.json
+          exit-code: '0'
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: fulfillops-security-reports
+          path: |
+            trivy-report.json
+            sbom.json
