@@ -1,501 +1,273 @@
 # FulfillOps — Resilient Order-Processing Platform
 
-FulfillOps is a DevOps capstone project for a fictional electronics-fulfilment business. It is designed to accept customer orders through an HTTP API, reserve inventory atomically, persist each accepted order and its background work, and let independent worker processes complete orders asynchronously. The project also targets reproducible container builds, automated quality and security gates, Kubernetes deployment, GitOps reconciliation, observability, and recovery from process and release failures.
+FulfillOps is a DevOps capstone project for a fictional electronics-fulfilment business. It accepts customer orders through a FastAPI service, reserves inventory transactionally, stores the accepted order and its background job in PostgreSQL, and lets separate worker processes complete orders asynchronously.
 
-> **Project status — 12 November 2026:** The FastAPI/PostgreSQL backend and its database migrations, seed routine, order-acceptance transaction, API tests, and local concurrency tests are implemented. The durable `jobs` table is present and each accepted order is written with a queued job in the same database transaction. The separate worker, full API/worker container stack, CI pipeline/SBOM, Kubernetes/Argo CD deployment, and the required operational fault-injection evidence are still team integration work. This README documents the complete target system while clearly identifying what is implemented and what remains to be demonstrated.
+The project combines an API, a durable PostgreSQL-backed work queue, Docker Compose, Kubernetes/kind, Argo CD GitOps, GitHub Actions, Prometheus and Grafana. This README describes the integrated project and records the evidence and limitations observed on **14 November 2026**.
 
-## Contents
+> **Evidence note:** Implemented functionality, tested behavior and remaining hardening work are identified separately below. A passing API checker or a healthy deployment does not by itself prove every advanced reliability or security requirement.
 
-- [Project goals](#project-goals)
-- [Current implementation status](#current-implementation-status)
-- [Architecture](#architecture)
-- [Technology stack](#technology-stack)
-- [Repository structure](#repository-structure)
-- [API contract](#api-contract)
-- [Catalog and initial inventory](#catalog-and-initial-inventory)
-- [Run the current backend locally](#run-the-current-backend-locally)
-- [Run the automated tests](#run-the-automated-tests)
-- [Order-processing and worker design](#order-processing-and-worker-design)
-- [Target delivery and deployment workflow](#target-delivery-and-deployment-workflow)
-- [Reliability and security requirements](#reliability-and-security-requirements)
-- [Verification evidence and remaining work](#verification-evidence-and-remaining-work)
-- [Team responsibilities](#team-responsibilities)
+## Project status at a glance
 
-## Project goals
-
-The system is designed around the following requirements:
-
-1. Accept a valid order and return HTTP `202 Accepted` only after the order, inventory reservation, idempotency record, and durable work item have been committed.
-2. Prevent overselling when multiple clients compete for the same limited stock.
-3. Make retries safe: the same idempotency key and same semantic request must return the original order without reserving stock again.
-4. Process accepted orders asynchronously in a separate worker service.
-5. Recover work after a worker process dies, apply bounded retries with backoff, and retain permanently failing work for operator review.
-6. Run two API replicas and two independently operating worker instances against shared persistent state.
-7. Validate changes through automated tests, CI quality/security gates, an SBOM, container builds, Kubernetes health checks, GitOps reconciliation, and reproducible failure-recovery demonstrations.
-
-The detailed design, data model, request sequence, worker protocol, threat model, and deployment target are in [`docs/architecture.md`](docs/architecture.md). The database decision is recorded in [`docs/ADR-001.md`](docs/ADR-001.md).
-
-## Current implementation status
-
-| Area | Status | Notes |
+| Area | Current state | Evidence / limitation |
 |---|---|---|
-| FastAPI API | Implemented | Catalog, inventory, order creation, order lookup, liveness, readiness, and metrics routes are present. |
-| PostgreSQL schema | Implemented | Products, inventory, orders, order items, idempotency records, and durable jobs. |
-| Alembic migrations | Implemented | Current migration head: `7a894950e14c`. |
-| Atomic inventory reservation | Implemented and locally tested | Conditional database updates execute inside the order transaction; a failed multi-SKU reservation rolls back. |
-| Idempotency | Implemented and locally tested | Normalized payload hashing, transaction-scoped PostgreSQL advisory locking, and durable idempotency records. |
-| Durable job creation | Implemented | One queued job is inserted in the same transaction as each new order. |
-| Separate worker | Pending | Worker claiming, processing, retries, lease recovery, and dead-letter handling still need to be implemented and tested. |
-| Docker API/worker images and full Compose stack | Pending | The current Compose configuration is used to run PostgreSQL for local backend development. |
-| CI, security scanning, SBOM, immutable image publication | Pending | Must be added and evidenced in GitHub Actions. |
-| Kubernetes and Argo CD/GitOps | Pending | Target includes two API replicas and two independently operating worker instances. |
-| Fault injection, observed p95, rollout and incident evidence | Pending | Must be demonstrated in an isolated lab environment. |
+| FastAPI contract | Implemented | Health, catalog, inventory, order create/read and metrics endpoints. |
+| PostgreSQL and migrations | Implemented | PostgreSQL 16, SQLAlchemy 2 and Alembic. |
+| Atomic order acceptance | Implemented and tested | Order, order lines, inventory reservation, idempotency record and job are committed in one transaction. |
+| Idempotency and concurrency | Implemented and tested | Public checker passed replay, conflict, atomic stock competition and same-key stress checks. |
+| Separate worker | Implemented | Database-backed job claiming, leases, bounded retries and dead-letter handling. |
+| Docker Compose | Implemented | Database, migration, API and worker services; dedicated isolated test override. |
+| Kubernetes/kind | Deployed | Two API replicas, two worker replicas, PostgreSQL persistence, probes, Secret references and monitoring components. |
+| Argo CD | Deployed | Application reached `Synced` and `Healthy`; broken readiness release was detected and reverted through Git. |
+| CI and SBOM | Implemented, policy incomplete | GitHub Actions runs tests/build and produces Trivy and CycloneDX artifacts. The reviewed Trivy scan uses `exit-code: '0'`, so findings are reported but do not block the workflow. |
+| Container hardening | Incomplete | Current Dockerfile is single-stage and does not define a non-root runtime user. |
+| Kubernetes resource controls | Incomplete | API and worker Deployments still need CPU/memory requests and limits. |
+| Reliability hard gates | Partially demonstrated | Lease expiry/retry and poison-job behavior were exercised; an actual worker process kill during an in-flight committed job was not conclusively demonstrated. |
 
-The implementation status above is deliberately separate from the final target architecture. A design or requirement described below must not be treated as completed evidence until it is implemented and verified in the repository.
-
-## Architecture
-
-The current backend and the complete target system follow this flow:
+## Architecture overview
 
 ```mermaid
 flowchart LR
-    Client[Client] -->|HTTP + Idempotency-Key| API[FastAPI API]
-    API -->|Transactional reads and writes| DB[(PostgreSQL 16)]
-    DB --> P[Products and inventory]
-    DB --> O[Orders and order items]
-    DB --> I[Idempotency records]
-    DB --> J[Durable jobs table]
-    J -. pending worker claim .-> W[Worker service]
-    W -. pending status and retry updates .-> DB
-    API --> M[/Prometheus metrics/]
+    C[Client] -->|HTTP + Idempotency-Key| A[FastAPI API]
+    A -->|transaction| P[(PostgreSQL 16)]
+    P --> PR[Products and inventory]
+    P --> O[Orders and order items]
+    P --> I[Idempotency records]
+    P --> J[Durable jobs]
+    J --> W1[Worker replica 1]
+    J --> W2[Worker replica 2]
+    W1 --> P
+    W2 --> P
+    A --> M[Prometheus]
+    W1 --> M
+    W2 --> M
+    M --> G[Grafana]
+    Git[Git repository] --> Argo[Argo CD]
+    Argo --> K8s[Kubernetes / kind]
+    K8s --> A
+    K8s --> W1
+    K8s --> W2
 ```
 
-The API and database portions are implemented. The worker paths in the diagram are the required integration design and are not yet a running service in the current backend snapshot. The complete architecture is documented in [`docs/architecture.md`](docs/architecture.md).
+The API is responsible for accepting orders and reserving stock. The worker processes durable jobs after the API transaction commits. The worker does **not** reserve inventory a second time. PostgreSQL is the shared source of truth; job delivery is at-least-once, while the worker's business effect must remain idempotent.
+
+See [`docs/architecture.md`](docs/architecture.md) for the request flow, data model, worker lifecycle, deployment topology and operational evidence. The database decision is documented in [`docs/ADR-001.md`](docs/ADR-001.md), and the security review is in [`docs/threat-model.md`](docs/threat-model.md).
 
 ## Technology stack
 
-| Layer | Technology | Responsibility |
+| Layer | Technology | Role |
 |---|---|---|
-| Runtime | Python 3.12 | Backend application runtime. |
-| HTTP API | FastAPI | Routing, HTTP responses, OpenAPI documentation. |
-| Validation/configuration | Pydantic and Pydantic Settings | Request schemas and environment-based configuration. |
-| ORM/database access | SQLAlchemy 2 | Models, queries, and transaction management. |
-| Database | PostgreSQL 16 | Authoritative order, inventory, idempotency, and durable-job state. |
-| Migrations | Alembic | Versioned database schema changes. |
-| Tests | pytest and pytest-cov | API, persistence, and concurrency tests. |
-| Linting | Ruff | Static style and lint checks. |
-| Metrics | `prometheus-client` | Prometheus exposition endpoint and application metrics. |
-| Local database runtime | Docker Compose | Starts PostgreSQL for current local development. |
-| Target platform | Docker, Kubernetes/kind, Argo CD, GitHub Actions | Container delivery, orchestration, GitOps, and CI/CD; integration pending. |
-
-PostgreSQL is used as both the authoritative business-data store and the durable work table. The current design does not require a separate Redis broker. See [ADR-001](docs/ADR-001.md) for the decision and trade-offs.
-
-## Repository structure
-
-### Implemented backend structure
-
-```text
-FULFILLOPS/
-├── app/
-│   ├── api/
-│   │   ├── catalog.py
-│   │   ├── inventory.py
-│   │   └── orders.py
-│   ├── models/
-│   │   ├── product.py
-│   │   ├── inventory.py
-│   │   ├── order.py
-│   │   ├── order_item.py
-│   │   ├── idempotency.py
-│   │   └── job.py
-│   ├── schemas/
-│   ├── services/
-│   │   └── orders.py
-│   ├── config.py
-│   ├── database.py
-│   ├── main.py
-│   ├── metrics.py
-│   └── seed.py
-├── db/
-│   └── migrations/
-│       ├── env.py
-│       └── versions/
-├── tests/
-│   ├── conftest.py
-│   ├── test_api.py
-│   └── concurrency/
-│       └── test_concurrent_orders.py
-├── compose.yaml
-├── alembic.ini
-├── requirements.txt
-├── pyproject.toml
-├── .env.example
-└── README.md
-```
-
-### Additional target directories required for the complete capstone
-
-These components should be added as they are implemented; they are not all present in the current backend snapshot.
-
-```text
-FULFILLOPS/
-├── worker/                     # Separate worker process and retry/recovery logic
-├── infra/
-│   ├── k8s/                    # API/worker Deployments, Service, storage and probes
-│   └── argocd/                 # Argo CD Application/GitOps configuration
-├── .github/
-│   └── workflows/              # CI quality, test, scan, SBOM and build gates
-├── docs/
-│   ├── architecture.md
-│   ├── ADR-001.md
-│   ├── threat-model.md         # May be maintained as a separate document
-│   └── incident-postmortem.md  # Complete after the controlled incident exercise
-└── scripts/                    # Safe test reset, fault injection and evidence probes
-```
+| Runtime | Python 3.12 | API and worker runtime |
+| API | FastAPI, Pydantic | HTTP routes, request validation and OpenAPI |
+| Persistence | PostgreSQL 16, SQLAlchemy 2 | Orders, stock, idempotency and durable jobs |
+| Schema management | Alembic | Versioned database migrations |
+| Worker | Python process / PostgreSQL jobs table | Background processing, leases and retries |
+| Tests and lint | pytest, pytest-cov, Ruff | Regression and static checks |
+| Containers | Docker, Docker Compose | Local application and test environments |
+| Orchestration | Kubernetes/kind | Two API and two worker replicas, persistent database and probes |
+| GitOps | Argo CD | Reconcile Kubernetes from Git |
+| Observability | Prometheus, Grafana | Metrics scraping and dashboards |
+| CI/security | GitHub Actions, Trivy, CycloneDX SBOM | Automated tests, image scanning and software inventory |
 
 ## API contract
 
-The local API base URL is `http://127.0.0.1:8080`. The public API contract is version 1.1 and the required routes and response schemas are unchanged by the advanced reliability requirements.
+The local Compose API is published on `http://localhost:8000`. The isolated test Compose override publishes the API on `http://localhost:8001`.
 
-| Method | Path | Successful behavior |
+| Method | Route | Behavior |
 |---|---|---|
-| `GET` | `/health/live` | Returns `200` with `{"status":"ok"}`. Liveness is independent of database availability. |
-| `GET` | `/health/ready` | Returns `200` with `{"status":"ready"}` when the database is reachable and required migrations are applied; otherwise `503` with `{"status":"not_ready"}`. |
-| `GET` | `/api/v1/catalog` | Returns the three required catalog SKUs and prices. |
-| `GET` | `/api/v1/inventory/{sku}` | Returns SKU and nonnegative available quantity; unknown SKU returns `404 SKU_NOT_FOUND`. |
-| `POST` | `/api/v1/orders` | Validates the request, reserves stock, persists the order/idempotency/job records, and returns `202`. |
-| `GET` | `/api/v1/orders/{order_id}` | Returns the order ID, status, and total; unknown order returns `404 ORDER_NOT_FOUND`. |
-| `GET` | `/metrics` | Returns Prometheus text exposition format. |
+| `GET` | `/health/live` | Liveness check; returns `200` while the process is alive. |
+| `GET` | `/health/ready` | Readiness check; confirms the database connection and application readiness. |
+| `GET` | `/api/v1/catalog` | Returns the fixed product catalog and prices. |
+| `GET` | `/api/v1/inventory/{sku}` | Returns the available quantity for a SKU. |
+| `POST` | `/api/v1/orders` | Accepts and persists an order; requires `Idempotency-Key`; returns `202`. |
+| `GET` | `/api/v1/orders/{order_id}` | Returns the persisted order status and total. |
+| `GET` | `/metrics` | Prometheus metrics exposition. |
 
-### Create-order request
+Order requests require an `Idempotency-Key` header. The service normalizes duplicate SKU lines, validates products and quantities, calculates totals in integer cents, and reserves inventory using conditional database updates. Replaying the same key with the same semantic payload returns the original order. Reusing the key with a different payload returns `409 IDEMPOTENCY_CONFLICT`.
 
-A request must include an `Idempotency-Key` header containing 8–128 printable ASCII characters.
+### Fixed catalog and initial stock
 
-```http
-POST /api/v1/orders
-Content-Type: application/json
-Idempotency-Key: demo-order-0001
-```
+| SKU | Unit price | Initial stock in a fresh database |
+|---|---:|---:|
+| `KIT-100` | €12.99 | 7 |
+| `PART-200` | €5.99 | 12 |
+| `PACK-300` | €2.49 | 5 |
 
-```json
-{
-  "customer_id": "CUST-042",
-  "items": [
-    {"sku": "KIT-100", "quantity": 1},
-    {"sku": "PART-200", "quantity": 2}
-  ]
-}
-```
+The seed routine inserts missing catalog rows; it does not replenish stock on every run. Public checker concurrency and stress runs consume inventory and must only use a fresh, isolated test database.
 
-A first successful acceptance returns `202`:
+## Run with Docker Compose
 
-```json
-{"order_id":"<uuid>","status":"queued"}
-```
+Prerequisites: Docker Desktop with the Linux engine enabled, Git, and Python 3.12 for optional local tooling.
 
-The acceptance response is sent after the order and stock reservation are committed, but before worker processing. A semantically identical replay with the same key returns the original order ID and does not reserve stock again. Reusing the key with a different payload returns `409 IDEMPOTENCY_CONFLICT`.
+1. Clone the repository and enter it:
 
-### Validation and error codes
+   ```powershell
+   git clone https://github.com/BenjaminGERARD2006/FULFILLOPS.git
+   Set-Location FULFILLOPS
+   ```
 
-All error responses use this shape:
+2. Create the local environment file and set a private database password:
 
-```json
-{
-  "error": {
-    "code": "OUT_OF_STOCK",
-    "message": "Not enough items available"
-  }
-}
-```
+   ```powershell
+   Copy-Item .env.example .env
+   notepad .env
+   ```
 
-| HTTP status | Error code | Meaning |
-|---:|---|---|
-| `400` | `IDEMPOTENCY_REQUIRED` | Idempotency-Key is missing. |
-| `400` | `INVALID_JSON` | Request body is not valid JSON. |
-| `400` | `INVALID_REQUEST` | General request structure is invalid. |
-| `422` | `INVALID_QUANTITY` | Quantity is not a valid positive integer from 1 to 20. Booleans are not accepted as integers. |
-| `422` | `INVALID_SKU` | SKU is not part of the catalog. |
-| `409` | `OUT_OF_STOCK` | Requested stock is not available. |
-| `409` | `IDEMPOTENCY_CONFLICT` | An existing key was reused with a different semantic payload. |
-| `404` | `SKU_NOT_FOUND` | Inventory was requested for an unknown SKU. |
-| `404` | `ORDER_NOT_FOUND` | Requested order does not exist. |
+   The Compose configuration expects `DB_PASSWORD`. Do not commit `.env` or paste credentials into logs or screenshots.
 
-The request body limit is 16 KiB. `customer_id` must be a nonempty string of at most 64 characters. `items` must contain 1–10 lines. Each quantity must be 1–20. Repeated lines for the same SKU are aggregated before stock checks and total calculation.
+3. Build and start the Compose stack:
 
-## Catalog and initial inventory
+   ```powershell
+   docker compose up -d --build
+   docker compose ps
+   ```
 
-The seed routine inserts the following products and inventory when they do not already exist. It does not reset stock on every application restart.
+   Compose starts PostgreSQL, runs the migration service, then starts the API and worker. The database is published on host port `5433`; the API is published on host port `8000`.
 
-| SKU | Price in cents | Display price | Initial stock |
-|---|---:|---:|---:|
-| `KIT-100` | 1299 | €12.99 | 7 |
-| `PART-200` | 599 | €5.99 | 12 |
-| `PACK-300` | 249 | €2.49 | 5 |
+4. Check the API:
 
-A clean isolated test dataset must start with these quantities. The concurrency and stress checkers consume stock, so they must never be run against a shared or production database.
+   ```powershell
+   Invoke-RestMethod http://localhost:8000/health/live
+   Invoke-RestMethod http://localhost:8000/health/ready
+   Invoke-RestMethod http://localhost:8000/api/v1/catalog
+   ```
 
-## Run the current backend locally
+5. Inspect logs and metrics:
 
-These instructions describe the implemented local backend workflow on Windows 11 using PowerShell. They do not claim that the complete worker/API Compose stack is available yet.
+   ```powershell
+   docker compose logs --tail 100 api worker
+   Invoke-WebRequest http://localhost:8000/metrics
+   ```
 
-### 1. Clone the repository and create a virtual environment
+To stop the application containers while preserving the PostgreSQL volume, use `docker compose down` (do **not** add `-v` when you intend to preserve data).
+
+## Run tests safely
+
+The automated tests and public checker can modify order and inventory state. Use the isolated test Compose override; never run destructive tests against the development database.
+
+The repository includes `compose.test.yaml`. It overrides the database name, ports and storage so the test database uses the dedicated Docker volume `fulfillops_test_postgres_data`, separate from the development volume `postgres_data`.
 
 ```powershell
-git clone https://github.com/BenjaminGERARD2006/FULFILLOPS.git
-Set-Location FULFILLOPS
+$files = @("-f", ".\compose.yaml", "-f", ".\compose.test.yaml")
 
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+# Start the isolated test database
+docker compose @files up -d db
+
+# Apply migrations and seed the isolated catalog
+docker compose @files run --rm migrate
+docker compose @files run --rm api python -m app.seed
+
+# Start the test API and worker
+docker compose @files up -d api worker
+
+docker compose @files ps
+Invoke-RestMethod http://localhost:8001/health/live
+Invoke-RestMethod http://localhost:8001/health/ready
 ```
 
-If PowerShell blocks activation, use the permitted execution-policy approach provided by your institution or activate the environment from a terminal configured for Python. Do not commit the `.venv` directory.
-
-### 2. Create the local environment file
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-Set values for the local development database. Use a private password and do not paste it into Git, screenshots, issues, or logs.
-
-```dotenv
-POSTGRES_DB=fulfillops
-POSTGRES_USER=fulfillops
-DB_PASSWORD=replace-with-a-local-private-password
-DB_HOST=127.0.0.1
-DB_PORT=5433
-```
-
-The Compose mapping exposes the PostgreSQL container on host port `5433` to avoid conflict with a local PostgreSQL service already using port `5432`. Keep `.env` private; `.env.example` must contain placeholders only.
-
-### 3. Start PostgreSQL
-
-```powershell
-docker compose up -d db
-docker compose ps
-```
-
-Wait until the database container is healthy before continuing.
-
-### 4. Apply migrations and seed the development database
-
-```powershell
-alembic upgrade head
-python -m app.seed
-```
-
-The seed routine inserts missing records but does not replenish inventory already consumed by orders.
-
-### 5. Start the API
-
-```powershell
-python -m uvicorn app.main:app --reload --port 8080
-```
-
-Open the interactive API documentation at <http://127.0.0.1:8080/docs>.
-
-In a second PowerShell window, verify the service:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8080/health/live
-Invoke-RestMethod http://127.0.0.1:8080/health/ready
-Invoke-RestMethod http://127.0.0.1:8080/api/v1/catalog
-```
-
-### 6. Create a test order
-
-Use a unique idempotency key for each new logical request:
-
-```powershell
-$headers = @{ "Idempotency-Key" = "demo-order-0001" }
-$body = @{
-    customer_id = "CUST-042"
-    items = @(
-        @{ sku = "KIT-100"; quantity = 1 }
-        @{ sku = "PART-200"; quantity = 2 }
-    )
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method Post `
-    -Uri http://127.0.0.1:8080/api/v1/orders `
-    -Headers $headers `
-    -ContentType "application/json" `
-    -Body $body
-```
-
-The current backend returns an acceptance receipt with `status: "queued"`. Because the separate worker is pending, an order will remain queued until worker integration is completed.
-
-## Run the automated tests
-
-The test suite is destructive to the application tables in the database selected by its environment settings. It has a safety guard and refuses to run unless the selected database name is exactly `fulfillops_test`.
-
-### 1. Create the isolated test database once
-
-With the PostgreSQL Compose service running:
-
-```powershell
-docker compose exec db psql -U fulfillops -d postgres -c "CREATE DATABASE fulfillops_test;"
-```
-
-If PostgreSQL reports that the database already exists, do not recreate or drop it; continue with the next step.
-
-### 2. Select the test database and apply migrations
+For local pytest runs, select the isolated database in the current PowerShell session and check the selected name before testing:
 
 ```powershell
 $env:POSTGRES_DB = "fulfillops_test"
 python -c "from app.config import settings; print(settings.POSTGRES_DB)"
-alembic upgrade head
-```
-
-The printed database name must be `fulfillops_test` before running tests.
-
-### 3. Run tests and lint checks
-
-```powershell
 python -m pytest -v
 ruff check app tests
-python -m pytest --cov=app --cov-report=term-missing
 ```
 
-PowerShell environment variables are scoped to the current terminal window. Set `$env:POSTGRES_DB = "fulfillops_test"` again in every new window before running tests. The test fixture truncates and reseeds the test tables around tests; it must never be pointed at the development or a production database.
-
-When finished, remove the test database override from that terminal:
+Remove the override when finished:
 
 ```powershell
 Remove-Item Env:POSTGRES_DB -ErrorAction SilentlyContinue
 ```
 
-**Important:** Do not run the public checker's `--concurrency` or `--stress` options against the main development database. Those tests consume inventory. Use a freshly seeded, isolated test environment only.
+### Official public checker evidence
 
-## Order-processing and worker design
+The instructor-provided checker is not stored in this repository. It was run from the extracted course pack against the isolated test API:
 
-### API transaction boundary
+```powershell
+py "$checkDir\fulfillops_public_checker.py" --base-url http://localhost:8001 --concurrency --stress
+```
 
-For a new order, the service normalizes and aggregates duplicate SKU lines, hashes the canonical payload, and opens a PostgreSQL transaction. It serializes requests sharing an idempotency key using a transaction-scoped advisory lock. It then checks the durable idempotency record, validates products and prices, and reserves each SKU using a conditional database update. The order, order lines, idempotency record, inventory decrements, and one queued `jobs` row are committed together.
+**Observed result on 14 November 2026: 15 passed / 0 failed / 0 skipped.** This included health, catalog, validation, idempotency replay/conflict, worker completion, inventory-once behavior, Prometheus metrics, concurrent inventory reservations, eight simultaneous identical-key requests and duplicate-line aggregation. The detailed output is recorded in [`docs/public-checker-evidence.md`](docs/public-checker-evidence.md).
 
-This transaction boundary ensures that an accepted order does not exist without its durable job and that a multi-SKU request cannot partially reserve stock if one line fails. The API reserves stock at acceptance time; the worker must not decrement inventory again.
+The checker consumes inventory. Do not rerun it against the development database or a test database containing data that must be preserved. Recreate a fresh isolated test database before another full concurrency/stress run.
 
-### Target worker behavior — implementation pending
+## Kubernetes and GitOps
 
-The worker is a separate process/service. Its required responsibilities are:
+The Kubernetes manifests are under `k8s/`; the Argo CD Application is under `infra/argocd/`.
 
-- Atomically claim due queued work using database row locking (normally `FOR UPDATE SKIP LOCKED`) so two workers do not claim the same live job.
-- Reclaim jobs whose `running` lease has expired after a worker crash.
-- Persist the worker identity, attempt count, and lease expiry.
-- Transition the order to `processing`, then to `completed` on success.
-- On a retryable error, record a safe error, clear/renew lease fields as appropriate, and schedule a bounded retry using exponential backoff.
-- After the retry limit, set the job to `dead` and the order to `failed`; retain the records for operator review.
-- Make the business effect idempotent under at-least-once delivery. Delivery itself is not exactly once; the worker must ensure that retries or lease recovery do not perform the same business outcome twice.
-- Never reserve inventory again. Do not automatically restock a failed/poisoned order unless a separate compensating workflow is designed, reviewed, and tested.
+The deployed kind environment includes:
 
-The current `jobs` table exposes `id`, `order_id`, `status`, `attempts`, `max_attempts`, `available_at`, `locked_until`, `locked_by`, `last_error`, `created_at`, and `updated_at`. The model default for `max_attempts` is 5.
+- `fulfillops-api` Deployment with two replicas and a Service;
+- `fulfillops-worker` Deployment with two worker replicas and worker-specific IDs from Pod metadata;
+- PostgreSQL with persistent storage and a Kubernetes Secret reference for its password;
+- liveness and readiness probes on the API;
+- Prometheus scraping API and worker metrics, plus Grafana;
+- an Argo CD Application configured to sync the `k8s/` Kustomize application from the `main` branch with self-healing enabled.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full worker state model and integration invariants.
+The deployment was observed as `Synced` and `Healthy`. A deliberately broken API readiness path returned HTTP 404 in Pod probe events; the change was reverted in Git and the application returned to a healthy state. The drift-reconciliation exercise was not captured comprehensively enough to claim a full, repeatable self-healing demonstration.
 
-## Target delivery and deployment workflow
+## Observability and reliability evidence
 
-The complete capstone target is:
+The application exports order, failure, request and worker retry metrics. The worker exposes its process metrics on port `9101`.
 
-1. **Pull request CI:** formatting/lint, unit and integration tests, isolated public contract checker including concurrency/stress, application and worker image builds, dependency/image vulnerability scanning, and SBOM generation.
-2. **Quality gate:** required checks must pass before an artifact can be promoted. Critical findings follow a documented blocking policy; informational findings are recorded.
-3. **Immutable build output:** publish images using a commit-SHA tag or digest; do not deploy a mutable `latest` tag as the release identity.
-4. **Local Compose:** one reproducible stack for API, worker, and PostgreSQL, with health checks, volumes, environment configuration, and non-root application containers.
-5. **Kubernetes:** API Deployment with two replicas, worker Deployment with two independent worker instances, Service, ConfigMap, Secret references, readiness/liveness probes, CPU/memory requests and limits, and persistent database storage/configuration.
-6. **Argo CD/GitOps:** reconcile the cluster from the Git repository. Demonstrate drift detection and reconciliation. A broken release must be restored to a known-good Git revision; a manual cluster patch is not the final recovery state.
-7. **Operations evidence:** two controlled fault exercises, 30-second continuous readiness probe during a healthy rolling update, at least 200 HTTP samples for an observed p95, metrics/log evidence, and a blameless incident report.
+Recorded evidence:
 
-These items are requirements for final team acceptance, not claims that this deployment pipeline has already been created. The exact target components and proof checklist are in [`docs/architecture.md`](docs/architecture.md).
+- **Public contract checker:** 15/15 passed, no failures or skips.
+- **Persistence:** an order with ID `41ce2576-2367-4e42-be76-0dd3efacd108` remained `completed` after PostgreSQL restart and was retrieved through the API after API and worker restarts. See [`docs/persistence-evidence.md`](docs/persistence-evidence.md).
+- **HTTP sampling:** 200 catalog requests, 200 successful responses, 0 failures, observed p95 of approximately **9.236 ms**. Conditions and CSV are in [`docs/observability-evidence.md`](docs/observability-evidence.md) and [`docs/http_samples.csv`](docs/http_samples.csv).
+- **Rollout probe:** 121 samples over approximately 30 seconds. Two requests returned HTTP 502 due to upstream timeouts during the rollout; the service subsequently recovered. This is evidence of recovery, **not** a zero-error rollout.
+- **Release fault exercise:** a deliberately broken readiness path produced probe failures (HTTP 404); a Git revert restored the known-good readiness endpoints. See [`docs/incident-postmortem.md`](docs/incident-postmortem.md).
+- **Worker retry and poison-job behavior:** bounded retry/dead-letter and lease-expiry scenarios were exercised. A process kill during an actual in-flight job remains an unproven hard-gate scenario.
 
-## Reliability and security requirements
+## CI, SBOM and security limitations
 
-The system must preserve these invariants:
+`.github/workflows/ci.yml` runs automated tests, builds the application image, runs Trivy image scanning and generates a CycloneDX SBOM artifact. The current Trivy action is configured with `exit-code: '0'`, so vulnerability findings are uploaded as a report but do not block the workflow. The workflow should not be described as enforcing a vulnerability-blocking security gate until a blocking policy and severity threshold are configured.
 
-- `inventory.available` is never negative.
-- A failed multi-item reservation rolls back all stock decrements.
-- A client idempotency key maps to at most one accepted order.
-- Replaying the same key and semantic payload does not reserve stock twice.
-- Reusing a key with a different semantic payload is rejected.
-- The order, item rows, inventory changes, idempotency record, and durable work item are committed atomically.
-- An accepted order survives API and worker restarts.
-- Worker retries and lease recovery do not produce a duplicate business outcome.
-- A permanently failing order remains visible as `failed` and its job remains available for operator review.
+The current `Dockerfile` is single-stage and does not switch to a non-root runtime user. The API and worker Kubernetes Deployments also need explicit CPU/memory requests and limits. These are known hardening tasks, not completed controls. See [`docs/threat-model.md`](docs/threat-model.md).
 
-Security basics:
+## Repository layout
 
-- Keep `.env`, database passwords, GitHub tokens, private keys, and production credentials out of Git.
-- Use environment variables or the deployment platform's Secret mechanism; `.env.example` contains placeholders only.
-- Validate inputs and enforce the request body limit.
-- Return safe machine-readable errors; do not expose SQL, stack traces, credentials, or personal data.
-- Keep tests and stock-consuming checkers on an isolated test database.
-- Avoid customer IDs and idempotency keys as Prometheus labels.
-- Run fault injection only against infrastructure controlled by the team.
+```text
+FULFILLOPS/
+├── app/                    # FastAPI routes, schemas, models, services, config and seed
+├── worker/                 # Durable background worker
+├── db/migrations/          # Alembic migration environment and versions
+├── tests/                  # API, database and concurrency tests
+├── k8s/                    # Kubernetes manifests and Kustomize application
+├── infra/argocd/            # Argo CD Application
+├── .github/workflows/       # GitHub Actions CI
+├── docs/                    # Architecture, ADR, threat model and evidence
+├── compose.yaml             # Development Compose stack
+├── compose.test.yaml        # Isolated test Compose override
+├── Dockerfile
+├── alembic.ini
+├── requirements.txt
+├── pyproject.toml
+└── README.md
+```
 
-## Verification evidence and remaining work
+## Project documentation
 
-### Backend evidence recorded on 12 November 2026
-
-The latest reported local backend verification was:
-
-- `python -m pytest -v`: **24 passed**.
-- `pytest-cov`: **94% overall line coverage** at the time of the report.
-- `ruff check app tests`: all checks passed.
-- Python compilation check: passed.
-- Concurrency tests: seven distinct-key orders accepted from ten competitors for seven available units; eight concurrent identical-key calls returned one order ID and created one reservation; duplicate SKU lines were aggregated.
-- Manual API checks: catalog, inventory, health, order acceptance/retrieval, idempotency replay/conflict, out-of-stock rollback, unknown SKU, and metrics endpoint.
-
-These are local backend results from the current implementation snapshot. They are not a result from the full public checker, cross-replica API test, worker recovery test, CI pipeline, or Kubernetes deployment. Re-run all checks after team integration.
-
-### Remaining final-acceptance evidence
-
-- [ ] Implement and test the separate worker.
-- [ ] Demonstrate two workers processing different jobs safely.
-- [ ] Kill a worker while a committed order is processing; prove lease recovery and one business outcome.
-- [ ] Inject a deterministic poison job; prove bounded retries and persistent `dead`/`failed` state.
-- [ ] Run two API replicas against the same database; prove eight same-key requests return one order ID and reserve stock once.
-- [ ] Run the public API checker with both `--concurrency` and `--stress` on a fresh isolated test database, with no skipped checks.
-- [ ] Build multistage non-root API/worker images and a complete Compose stack.
-- [ ] Add CI quality/security gates, a documented vulnerability policy, SBOM artifact, and immutable image tag/digest.
-- [ ] Deploy to kind/Kubernetes with two API and two worker instances; configure persistent storage and health probes.
-- [ ] Demonstrate Argo CD `Synced`/`Healthy`, drift correction, and recovery from a deliberately broken revision through Git.
-- [ ] Record a time-stamped 30-second successful rolling-update probe.
-- [ ] Collect at least 200 HTTP samples and report the observed p95 with test conditions and limitations.
-- [ ] Perform both controlled fault exercises and complete a blameless incident postmortem.
-- [ ] Add the final evidence to the report and demo; document each student's contribution and assistance disclosures.
+- [`docs/architecture.md`](docs/architecture.md) — system design and implementation/evidence status.
+- [`docs/ADR-001.md`](docs/ADR-001.md) — PostgreSQL as the transactional store and durable work table.
+- [`docs/threat-model.md`](docs/threat-model.md) — assets, trust boundaries, threats and residual risks.
+- [`docs/incident-postmortem.md`](docs/incident-postmortem.md) — broken readiness rollout and recovery.
+- [`docs/public-checker-evidence.md`](docs/public-checker-evidence.md) — official 15-check result.
+- [`docs/persistence-evidence.md`](docs/persistence-evidence.md) — data survival across restarts.
+- [`docs/observability-evidence.md`](docs/observability-evidence.md) — p95 and rollout probe observations.
+- [`docs/assistance-log.md`](docs/assistance-log.md) — AI assistance disclosure and contribution record.
 
 ## Team responsibilities
 
-The agreed initial division of work is:
+The agreed division of work assigns Student 1 to backend/database responsibilities, Student 2 to worker/reliability responsibilities, and Student 3 to platform/delivery responsibilities. See [`docs/assistance-log.md`](docs/assistance-log.md) for the individual contribution and assistance disclosure. Each student should describe only the work they personally implemented, reviewed or tested.
 
-| Team member | Primary responsibility | Integration points |
-|---|---|---|
-| Student 1 — Backend/database | FastAPI routes, SQLAlchemy models, PostgreSQL schema/migrations, order transaction, inventory reservation, idempotency, seed logic, backend tests. | Publishes the order and `jobs` database contract for the worker. |
-| Student 2 — Worker/reliability | Separate worker, atomic job claim, leases, expired-lease recovery, bounded retry/backoff, dead-letter handling, worker tests and worker incident evidence. | Uses the shared PostgreSQL `jobs` table; must not reserve inventory again. |
-| Student 3 — Platform/delivery | API/worker containers, Docker Compose, GitHub Actions, image scanning/SBOM, Kubernetes/kind, Argo CD/GitOps, deployment and rollout evidence. | Packages and deploys the API and worker against the shared database configuration. |
+## Known remaining work
 
-All team members should be able to explain the full request lifecycle, failure boundaries, concurrency controls, and their own implementation/review contributions during the individual oral defense.
+1. Demonstrate an actual worker process kill after claiming an in-flight committed order and prove recovery without duplicate business effects.
+2. Capture a complete GitOps drift and automatic self-healing demonstration.
+3. Add a documented vulnerability policy that blocks the selected severity level in CI.
+4. Convert the Dockerfile to a multi-stage build with a non-root runtime user.
+5. Add CPU/memory requests and limits to the API and worker Kubernetes Deployments.
+6. Verify the final report length, demo timing, instructor access and submission ZIP contents.
 
----
-
-## Useful commands
-
-```powershell
-# Check local changes and recent history
-git status
-git log --oneline -5
-
-# Check services
-docker compose ps
-
-# Check migrations
-alembic current
-alembic heads
-
-# Run backend quality checks (select fulfillops_test first)
-python -m pytest -v
-ruff check app tests
-```
-
-**Repository:** <https://github.com/BenjaminGERARD2006/FULFILLOPS>
+These limitations are intentionally disclosed so the repository distinguishes implemented functionality from evidence that remains outstanding.
