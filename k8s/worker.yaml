@@ -11,12 +11,20 @@ spec:
     metadata:
       labels:
         app: fulfillops-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9101"
     spec:
       containers:
         - name: worker
           image: fulfillops-api:latest
           imagePullPolicy: Never
           command: ["python", "-m", "worker.main"]
+          ports:
+            - name: metrics
+              containerPort: 9101
+              protocol: TCP
           env:
             - name: POSTGRES_DB
               value: "fulfillops"

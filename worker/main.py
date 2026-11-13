@@ -1,6 +1,7 @@
 import logging
 import time
 
+from prometheus_client import start_http_server
 from sqlalchemy import create_engine, text
 
 from worker.config import (
@@ -15,14 +16,14 @@ from worker.retry import handle_failure
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True
+    pool_pre_ping=True,
 )
 
 
@@ -38,14 +39,14 @@ def run_worker():
                 if recovered:
                     logger.info(
                         "Recovered %s expired jobs",
-                        recovered
+                        recovered,
                     )
 
-            # 2. Claim a queued job.
+            # 2. Claim one available queued job.
             with engine.begin() as connection:
                 job = claim_job(connection, WORKER_ID)
 
-            # 3. Wait if there are no jobs.
+            # 3. Wait if there are no available jobs.
             if job is None:
                 time.sleep(POLL_INTERVAL)
                 continue
@@ -71,8 +72,8 @@ def run_worker():
                         """),
                         {
                             "job_id": job["id"],
-                            "worker_id": WORKER_ID
-                        }
+                            "worker_id": WORKER_ID,
+                        },
                     )
 
                     if result.rowcount != 1:
@@ -82,26 +83,26 @@ def run_worker():
 
                 logger.info(
                     "Completed job: %s",
-                    job["id"]
+                    job["id"],
                 )
 
             except Exception as error:
                 logger.exception(
                     "Failed processing job %s",
-                    job["id"]
+                    job["id"],
                 )
 
-                # 5. Schedule a retry or move to dead-letter.
+                # 5. Schedule a retry or move the job to dead-letter.
                 job_with_worker = {
                     **job,
-                    "worker_id": WORKER_ID
+                    "worker_id": WORKER_ID,
                 }
 
                 with engine.begin() as connection:
                     handle_failure(
                         connection,
                         job_with_worker,
-                        error
+                        error,
                     )
 
         except Exception:
@@ -110,6 +111,11 @@ def run_worker():
 
 
 if __name__ == "__main__":
+    # Expose this worker's Prometheus metrics on port 9101.
+    start_http_server(port=9101, addr="0.0.0.0")
+
+    logger.info("Worker metrics endpoint listening on port 9101")
+
     try:
         run_worker()
     except KeyboardInterrupt:

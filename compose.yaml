@@ -52,6 +52,8 @@ services:
     build: .
     command: ["python", "-m", "worker.main"]
     restart: unless-stopped
+    expose:
+      - "9101"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-fulfillops}
       POSTGRES_USER: ${POSTGRES_USER:-fulfillops}

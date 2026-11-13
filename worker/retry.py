@@ -2,12 +2,17 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
 
+from app.metrics import ORDERS_FAILED, WORKER_RETRIES
+
 
 def calculate_backoff(attempts):
+    """Calculate exponential retry delay, capped at 60 seconds."""
     return min(2 ** max(attempts - 1, 0), 60)
 
 
 def handle_failure(connection, job, error):
+    """Schedule a failed job for retry or move it to dead-letter."""
+
     attempts = job["attempts"]
     max_attempts = job["max_attempts"]
     worker_id = job["worker_id"]
@@ -15,6 +20,7 @@ def handle_failure(connection, job, error):
     now = datetime.now(UTC)
     error_message = str(error)[:1000]
 
+    # Maximum attempts reached: move the job to dead-letter.
     if attempts >= max_attempts:
         result = connection.execute(
             text("""
@@ -54,8 +60,12 @@ def handle_failure(connection, job, error):
             }
         )
 
+        # Record the terminal order failure.
+        ORDERS_FAILED.inc()
+
         return "dead"
 
+    # Attempts remain: schedule another retry.
     delay = calculate_backoff(attempts)
     next_attempt = now + timedelta(seconds=delay)
 
@@ -84,5 +94,8 @@ def handle_failure(connection, job, error):
 
     if result.rowcount != 1:
         return "ownership_lost"
+
+    # Record a successfully scheduled retry.
+    WORKER_RETRIES.inc()
 
     return "queued"

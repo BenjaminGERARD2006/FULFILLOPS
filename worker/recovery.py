@@ -1,13 +1,16 @@
-
 from datetime import UTC, datetime
 
 from sqlalchemy import text
 
+from app.metrics import ORDERS_FAILED, WORKER_RETRIES
+
 
 def recover_expired_jobs(connection):
+    """Recover jobs whose worker leases have expired."""
+
     now = datetime.now(UTC)
 
-    # Jobs that have exhausted their attempts go to dead-letter.
+    # Jobs that exhausted their attempts go to dead-letter.
     exhausted = connection.execute(
         text("""
             UPDATE jobs
@@ -24,6 +27,7 @@ def recover_expired_jobs(connection):
         {"now": now},
     ).mappings().all()
 
+    # Mark the corresponding orders as failed.
     for row in exhausted:
         connection.execute(
             text("""
@@ -38,6 +42,10 @@ def recover_expired_jobs(connection):
                 "order_id": row["order_id"],
             },
         )
+
+    # Record terminal failures.
+    if exhausted:
+        ORDERS_FAILED.inc(len(exhausted))
 
     # Jobs with attempts remaining return to the queue.
     recovered = connection.execute(
@@ -55,4 +63,10 @@ def recover_expired_jobs(connection):
         {"now": now},
     )
 
-    return recovered.rowcount + len(exhausted)
+    recovered_count = recovered.rowcount
+
+    # Record recovered jobs as additional retry attempts.
+    if recovered_count:
+        WORKER_RETRIES.inc(recovered_count)
+
+    return recovered_count + len(exhausted)
