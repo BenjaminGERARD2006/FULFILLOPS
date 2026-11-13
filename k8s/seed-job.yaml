@@ -1,0 +1,28 @@
+﻿apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fulfillops-seed
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: fulfillops-api:latest
+          imagePullPolicy: Never
+          command: ["python", "-m", "app.seed"]
+          env:
+            - name: POSTGRES_DB
+              value: "fulfillops"
+            - name: POSTGRES_USER
+              value: "fulfillops"
+            - name: DB_HOST
+              value: "postgres"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fulfillops-db-secret
+                  key: password
