@@ -58,7 +58,6 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
       DB_HOST: db
       DB_PORT: "5432"
-      WORKER_ID: worker-1
       POLL_INTERVAL: "2"
       MAX_ATTEMPTS: "5"
       LEASE_SECONDS: "30"

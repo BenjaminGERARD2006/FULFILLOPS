@@ -1,0 +1,25 @@
+﻿services:
+  db:
+    container_name: fulfillops-test-db
+    ports: !override
+      - "5544:5432"
+    environment:
+      POSTGRES_DB: fulfillops_test
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+
+  migrate:
+    environment:
+      POSTGRES_DB: fulfillops_test
+
+  api:
+    ports: !override
+      - "8001:8000"
+    environment:
+      POSTGRES_DB: fulfillops_test
+
+  worker:
+    environment:
+      POSTGRES_DB: fulfillops_test
