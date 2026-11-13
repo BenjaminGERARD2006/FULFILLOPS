@@ -17,7 +17,7 @@ spec:
       labels:
         app: fulfillops-api
       annotations:
-        rollout.fulfillops.io/evidence: "healthy-rolling-update"
+        rollout.fulfillops.io/evidence: "healthy-rolling-update-verified"
     spec:
       containers:
         - name: api
