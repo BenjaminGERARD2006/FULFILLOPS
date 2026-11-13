@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fulfillops-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fulfillops-worker
+  template:
+    metadata:
+      labels:
+        app: fulfillops-worker
+    spec:
+      containers:
+        - name: worker
+          image: fulfillops-api:latest
+          imagePullPolicy: Never
+          command: ["python", "-m", "worker.main"]
+          env:
+            - name: POSTGRES_DB
+              value: "fulfillops"
+            - name: POSTGRES_USER
+              value: "fulfillops"
+            - name: DB_HOST
+              value: "postgres"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fulfillops-db-secret
+                  key: password
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POLL_INTERVAL
+              value: "2"
+            - name: MAX_ATTEMPTS
+              value: "5"
+            - name: LEASE_SECONDS
+              value: "30"
