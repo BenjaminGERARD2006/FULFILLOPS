@@ -17,7 +17,7 @@ spec:
       labels:
         app: fulfillops-api
       annotations:
-        rollout.fulfillops.io/evidence: "healthy-rolling-update-proxy-final"
+        rollout.fulfillops.io/evidence: "healthy-rolling-update-argo-manual-sync"
     spec:
       containers:
         - name: api
