@@ -11,13 +11,13 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
 
     ports:
-      - "5433:5432"
+      - "${DB_PORT:-5433}:5432"
 
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fulfillops -d fulfillops"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fulfillops} -d ${POSTGRES_DB:-fulfillops}"]
       interval: 5s
       timeout: 3s
       retries: 10
