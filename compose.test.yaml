@@ -9,6 +9,8 @@
       test:
         - CMD-SHELL
         - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+    volumes: !override
+      - fulfillops_test_postgres_data:/var/lib/postgresql/data
 
   migrate:
     environment:
@@ -23,3 +25,7 @@
   worker:
     environment:
       POSTGRES_DB: fulfillops_test
+
+volumes:
+  fulfillops_test_postgres_data:
+    name: fulfillops_test_postgres_data
